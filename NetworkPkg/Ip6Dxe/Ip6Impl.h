@@ -19,6 +19,7 @@
 #include <Protocol/IpSec.h>
 #include <Protocol/Ip6.h>
 #include <Protocol/Ip6Config.h>
+#include <Protocol/Ip6RaInfo.h>
 #include <Protocol/Dhcp6.h>
 #include <Protocol/DevicePath.h>
 #include <Protocol/HiiConfigRouting.h>
@@ -81,6 +82,9 @@
 
 #define IP6_SERVICE_FROM_PROTOCOL(Sb)   \
           CR ((Sb), IP6_SERVICE, ServiceBinding, IP6_SERVICE_SIGNATURE)
+
+#define IP6_SERVICE_FROM_RA_INFO_PROTOCOL(RaInfo) \
+          CR ((RaInfo), IP6_SERVICE, RaInfoProtocol, IP6_SERVICE_SIGNATURE)
 
 #define IP6_NO_MAPPING(IpInstance)  (!(IpInstance)->Interface->Configured)
 
@@ -159,6 +163,7 @@ struct _IP6_PROTOCOL {
 struct _IP6_SERVICE {
   UINT32                             Signature;
   EFI_SERVICE_BINDING_PROTOCOL       ServiceBinding;
+  EDKII_IP6_RA_INFO_PROTOCOL         RaInfoProtocol;
   INTN                               State;
 
   //
@@ -207,6 +212,8 @@ struct _IP6_SERVICE {
   UINT8                              *InterfaceId;
 
   BOOLEAN                            RouterAdvertiseReceived;
+  BOOLEAN                            RouterAdvertiseManagedFlag;
+  BOOLEAN                            RouterAdvertiseOtherConfigFlag;
   UINT8                              SolicitTimer;
   UINT32                             Ticks;
 

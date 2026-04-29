@@ -51,6 +51,7 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 #include <Protocol/Http.h>
 #include <Protocol/Ip4Config2.h>
 #include <Protocol/Ip6Config.h>
+#include <Protocol/Ip6RaInfo.h>
 #include <Protocol/RamDisk.h>
 #include <Protocol/AdapterInformation.h>
 

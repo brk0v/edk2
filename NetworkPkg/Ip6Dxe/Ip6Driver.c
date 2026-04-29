@@ -22,6 +22,45 @@ EFI_DRIVER_BINDING_PROTOCOL  gIp6DriverBinding = {
 BOOLEAN  mIpSec2Installed = FALSE;
 
 /**
+  Get the latest Router Advertisement M/O flag information.
+
+  @param[in]  This    Pointer to the EDKII_IP6_RA_INFO_PROTOCOL instance.
+  @param[out] RaInfo  Pointer to the buffer to receive Router Advertisement info.
+
+  @retval EFI_SUCCESS            Router Advertisement info is returned.
+  @retval EFI_INVALID_PARAMETER  This or RaInfo is NULL.
+  @retval EFI_NOT_READY          No valid Router Advertisement has been received.
+
+**/
+STATIC
+EFI_STATUS
+EFIAPI
+Ip6GetLatestRaInfo (
+  IN  EDKII_IP6_RA_INFO_PROTOCOL  *This,
+  OUT EDKII_IP6_RA_INFO           *RaInfo
+  )
+{
+  IP6_SERVICE  *IpSb;
+
+  if ((This == NULL) || (RaInfo == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  IpSb = IP6_SERVICE_FROM_RA_INFO_PROTOCOL (This);
+
+  if (!IpSb->RouterAdvertiseReceived) {
+    ZeroMem (RaInfo, sizeof (*RaInfo));
+    return EFI_NOT_READY;
+  }
+
+  RaInfo->Received        = TRUE;
+  RaInfo->ManagedFlag     = IpSb->RouterAdvertiseManagedFlag;
+  RaInfo->OtherConfigFlag = IpSb->RouterAdvertiseOtherConfigFlag;
+
+  return EFI_SUCCESS;
+}
+
+/**
    Callback function for IpSec2 Protocol install.
 
    @param[in] Event           Event whose notification function is being invoked
@@ -285,6 +324,7 @@ Ip6CreateService (
   IpSb->Signature                   = IP6_SERVICE_SIGNATURE;
   IpSb->ServiceBinding.CreateChild  = Ip6ServiceBindingCreateChild;
   IpSb->ServiceBinding.DestroyChild = Ip6ServiceBindingDestroyChild;
+  IpSb->RaInfoProtocol.GetLatestRaInfo = Ip6GetLatestRaInfo;
   IpSb->State                       = IP6_SERVICE_UNSTARTED;
 
   IpSb->NumChildren = 0;
@@ -336,9 +376,11 @@ Ip6CreateService (
   IpSb->InterfaceIdLen = IP6_IF_ID_LEN;
   IpSb->InterfaceId    = NULL;
 
-  IpSb->RouterAdvertiseReceived = FALSE;
-  IpSb->SolicitTimer            = IP6_MAX_RTR_SOLICITATIONS;
-  IpSb->Ticks                   = 0;
+  IpSb->RouterAdvertiseReceived        = FALSE;
+  IpSb->RouterAdvertiseManagedFlag     = FALSE;
+  IpSb->RouterAdvertiseOtherConfigFlag = FALSE;
+  IpSb->SolicitTimer                   = IP6_MAX_RTR_SOLICITATIONS;
+  IpSb->Ticks                          = 0;
 
   IpSb->Image      = ImageHandle;
   IpSb->Controller = Controller;
@@ -567,6 +609,8 @@ Ip6DriverBindingStart (
                   &IpSb->ServiceBinding,
                   &gEfiIp6ConfigProtocolGuid,
                   Ip6Cfg,
+                  &gEdkiiIp6RaInfoProtocolGuid,
+                  &IpSb->RaInfoProtocol,
                   NULL
                   );
   if (EFI_ERROR (Status)) {
@@ -678,6 +722,8 @@ UNINSTALL_PROTOCOL:
          &IpSb->ServiceBinding,
          &gEfiIp6ConfigProtocolGuid,
          Ip6Cfg,
+         &gEdkiiIp6RaInfoProtocolGuid,
+         &IpSb->RaInfoProtocol,
          NULL
          );
 
@@ -814,6 +860,8 @@ Ip6DriverBindingStop (
                     ServiceBinding,
                     &gEfiIp6ConfigProtocolGuid,
                     &IpSb->Ip6ConfigInstance.Ip6Config,
+                    &gEdkiiIp6RaInfoProtocolGuid,
+                    &IpSb->RaInfoProtocol,
                     NULL
                     );
     ASSERT_EFI_ERROR (Status);

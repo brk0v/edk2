@@ -152,8 +152,10 @@ Ip6ConfigOnPolicyChanged (
     //
     // Set parameters to trigger router solicitation sending in timer handler.
     //
-    IpSb->RouterAdvertiseReceived = FALSE;
-    IpSb->SolicitTimer            = IP6_MAX_RTR_SOLICITATIONS;
+    IpSb->RouterAdvertiseReceived        = FALSE;
+    IpSb->RouterAdvertiseManagedFlag     = FALSE;
+    IpSb->RouterAdvertiseOtherConfigFlag = FALSE;
+    IpSb->SolicitTimer                   = IP6_MAX_RTR_SOLICITATIONS;
     //
     // delay 1 second
     //

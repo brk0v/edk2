@@ -92,6 +92,7 @@
   gEfiIp6ServiceBindingProtocolGuid                ## BY_START
   gEfiIp6ProtocolGuid                              ## BY_START
   gEfiIp6ConfigProtocolGuid                        ## BY_START
+  gEdkiiIp6RaInfoProtocolGuid                      ## BY_START
   gEfiDhcp6ServiceBindingProtocolGuid              ## SOMETIMES_CONSUMES
   gEfiDhcp6ProtocolGuid                            ## SOMETIMES_CONSUMES
   gEfiIpSec2ProtocolGuid                           ## SOMETIMES_CONSUMES
