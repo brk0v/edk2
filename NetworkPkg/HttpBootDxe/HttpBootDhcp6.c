@@ -9,6 +9,122 @@ SPDX-License-Identifier: BSD-2-Clause-Patent
 
 #include "HttpBootDxe.h"
 
+#define HTTP_BOOT_DHCP6_SLAAC_DISCOVER_TIMEOUT  6
+#define HTTP_BOOT_DHCP6_INFO_REQ_TIMEOUT        6
+
+typedef struct {
+  HTTP_BOOT_PRIVATE_DATA    *Private;
+  BOOLEAN                   Accepted;
+} HTTP_BOOT_DHCP6_INFO_REQUEST_CONTEXT;
+
+typedef enum {
+  HttpBootDhcp6SlaacDecisionWait,
+  HttpBootDhcp6SlaacDecisionTryInfoRequest
+} HTTP_BOOT_DHCP6_SLAAC_DECISION;
+
+STATIC
+EFI_STATUS
+HttpBootGetSlaacPrefixLength (
+  IN  HTTP_BOOT_PRIVATE_DATA  *Private,
+  IN  EFI_IPv6_ADDRESS        *Ip6Addr,
+  OUT UINT8                   *PrefixLength
+  );
+
+/**
+  Validate that a DHCPv6 option buffer is well-formed.
+
+  @param[in]  Buffer        The pointer to the option buffer.
+  @param[in]  Length        Length of the option buffer.
+
+  @retval     TRUE          The option buffer is well-formed.
+  @retval     FALSE         The option buffer is malformed.
+
+**/
+STATIC
+BOOLEAN
+HttpBootIsDhcp6OptionListValid (
+  IN UINT8   *Buffer,
+  IN UINT32  Length
+  )
+{
+  EFI_DHCP6_PACKET_OPTION  *Option;
+  UINT32                   Offset;
+  UINT16                   OpLen;
+
+  if ((Buffer == NULL) && (Length != 0)) {
+    return FALSE;
+  }
+
+  Offset = 0;
+  while (Offset < Length) {
+    if (Length - Offset < sizeof (Option->OpCode) + sizeof (Option->OpLen)) {
+      return FALSE;
+    }
+
+    Option = (EFI_DHCP6_PACKET_OPTION *)(Buffer + Offset);
+    OpLen  = NTOHS (Option->OpLen);
+    Offset += sizeof (Option->OpCode) + sizeof (Option->OpLen);
+
+    if (OpLen > Length - Offset) {
+      return FALSE;
+    }
+
+    Offset += OpLen;
+  }
+
+  return TRUE;
+}
+
+/**
+  Release any DHCPv6 URI parsers cached in the shared offer buffer.
+
+  @param[in]  Private       The pointer to HTTP BOOT driver private data.
+
+**/
+STATIC
+VOID
+HttpBootDhcp6FreeOfferUriParsers (
+  IN HTTP_BOOT_PRIVATE_DATA  *Private
+  )
+{
+  UINTN  Index;
+
+  for (Index = 0; Index < HTTP_BOOT_OFFER_MAX_NUM; Index++) {
+    if (Private->OfferBuffer[Index].Dhcp6.UriParser != NULL) {
+      HttpUrlFreeParser (Private->OfferBuffer[Index].Dhcp6.UriParser);
+      Private->OfferBuffer[Index].Dhcp6.UriParser = NULL;
+    }
+  }
+}
+
+/**
+  Clear offer selection and cached packet state owned by the DHCPv6 path.
+
+  @param[in]  Private       The pointer to HTTP BOOT driver private data.
+
+**/
+STATIC
+VOID
+HttpBootDhcp6ClearOfferState (
+  IN HTTP_BOOT_PRIVATE_DATA  *Private
+  )
+{
+  UINTN  Index;
+
+  HttpBootDhcp6FreeOfferUriParsers (Private);
+
+  ZeroMem (Private->OfferBuffer, sizeof (Private->OfferBuffer));
+  for (Index = 0; Index < HTTP_BOOT_OFFER_MAX_NUM; Index++) {
+    Private->OfferBuffer[Index].Dhcp6.Packet.Offer.Size = HTTP_CACHED_DHCP6_PACKET_MAX_SIZE;
+  }
+
+  Private->OfferNum        = 0;
+  Private->SelectIndex     = 0;
+  Private->SelectProxyType = HttpOfferTypeMax;
+  ZeroMem (Private->OfferCount, sizeof (Private->OfferCount));
+  ZeroMem (Private->OfferIndex, sizeof (Private->OfferIndex));
+}
+
 /**
   Build the options buffer for the DHCPv6 request packet.
 
@@ -139,29 +255,140 @@ HttpBootParseDhcp6Options (
 {
   EFI_DHCP6_PACKET_OPTION  *Option;
   UINT32                   Offset;
+  UINT16                   OpLen;
 
-  Option = (EFI_DHCP6_PACKET_OPTION *)Buffer;
   Offset = 0;
 
   //
   // OpLen and OpCode here are both stored in network order.
   //
   while (Offset < Length) {
+    if (Length - Offset < sizeof (Option->OpCode) + sizeof (Option->OpLen)) {
+      return NULL;
+    }
+
+    Option = (EFI_DHCP6_PACKET_OPTION *)(Buffer + Offset);
+    OpLen  = NTOHS (Option->OpLen);
+    Offset += sizeof (Option->OpCode) + sizeof (Option->OpLen);
+    if (OpLen > Length - Offset) {
+      return NULL;
+    }
+
     if (NTOHS (Option->OpCode) == OptTag) {
       return Option;
     }
 
-    Offset += (NTOHS (Option->OpLen) + 4);
-    Option  = (EFI_DHCP6_PACKET_OPTION *)(Buffer + Offset);
+    Offset += OpLen;
   }
 
   return NULL;
 }
 
 /**
+  Copy a DHCPv6 packet into the cache and make the BootFile URL payload safe for
+  existing URI helpers that expect a NUL-terminated string.
+
+  @param[in]  Dst          The pointer to the cache buffer for DHCPv6 packet.
+  @param[in]  Src          The pointer to the DHCPv6 packet to be cached.
+  @param[in]  RequireBootFileUrl
+                           TRUE if the packet must include BootFile URL.
+
+  @retval     EFI_SUCCESS          Packet is copied.
+  @retval     EFI_DEVICE_ERROR     Packet is malformed or lacks required BootFile URL.
+  @retval     EFI_BUFFER_TOO_SMALL Cache buffer is not big enough.
+
+**/
+STATIC
+EFI_STATUS
+HttpBootCacheDhcp6InfoReply (
+  IN EFI_DHCP6_PACKET  *Dst,
+  IN EFI_DHCP6_PACKET  *Src,
+  IN BOOLEAN           RequireBootFileUrl
+  )
+{
+  EFI_DHCP6_PACKET_OPTION  *Option;
+  EFI_DHCP6_PACKET_OPTION  *NewOption;
+  UINT8                    *BootFileUrl;
+  UINT16                   BootFileUrlLen;
+  UINT32                   Offset;
+  UINT32                   NewOffset;
+  UINT32                   OptionsLength;
+  UINT16                   OpLen;
+  UINT16                   OpCode;
+
+  if ((Dst == NULL) || (Src == NULL) || (Src->Length < sizeof (EFI_DHCP6_HEADER))) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  OptionsLength = GET_DHCP6_OPTION_SIZE (Src);
+  if (!HttpBootIsDhcp6OptionListValid (Src->Dhcp6.Option, OptionsLength)) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  if (Dst->Size <= sizeof (EFI_DHCP6_HEADER)) {
+    return EFI_BUFFER_TOO_SMALL;
+  }
+
+  CopyMem (&Dst->Dhcp6.Header, &Src->Dhcp6.Header, sizeof (EFI_DHCP6_HEADER));
+
+  BootFileUrl    = NULL;
+  BootFileUrlLen = 0;
+  Offset         = 0;
+  NewOffset      = 0;
+  while (Offset < OptionsLength) {
+    Option = (EFI_DHCP6_PACKET_OPTION *)(Src->Dhcp6.Option + Offset);
+    OpLen  = NTOHS (Option->OpLen);
+    OpCode = NTOHS (Option->OpCode);
+
+    if (OpCode == DHCP6_OPT_BOOT_FILE_URL) {
+      BootFileUrl    = Option->Data;
+      BootFileUrlLen = OpLen;
+      Offset        += sizeof (Option->OpCode) + sizeof (Option->OpLen) + OpLen;
+      continue;
+    }
+
+    if (Dst->Size - sizeof (EFI_DHCP6_HEADER) - NewOffset < sizeof (Option->OpCode) + sizeof (Option->OpLen) + OpLen) {
+      return EFI_BUFFER_TOO_SMALL;
+    }
+
+    CopyMem (Dst->Dhcp6.Option + NewOffset, Option, sizeof (Option->OpCode) + sizeof (Option->OpLen) + OpLen);
+    NewOffset += sizeof (Option->OpCode) + sizeof (Option->OpLen) + OpLen;
+    Offset    += sizeof (Option->OpCode) + sizeof (Option->OpLen) + OpLen;
+  }
+
+  if (BootFileUrl == NULL) {
+    if (RequireBootFileUrl) {
+      return EFI_DEVICE_ERROR;
+    }
+
+    Dst->Length = sizeof (EFI_DHCP6_HEADER) + NewOffset;
+    return EFI_SUCCESS;
+  }
+
+  if ((BootFileUrlLen == 0) ||
+      (Dst->Size - sizeof (EFI_DHCP6_HEADER) - NewOffset < sizeof (NewOption->OpCode) + sizeof (NewOption->OpLen) + BootFileUrlLen + 1))
+  {
+    return EFI_BUFFER_TOO_SMALL;
+  }
+
+  NewOption         = (EFI_DHCP6_PACKET_OPTION *)(Dst->Dhcp6.Option + NewOffset);
+  NewOption->OpCode = HTONS (DHCP6_OPT_BOOT_FILE_URL);
+  NewOption->OpLen  = HTONS (BootFileUrlLen);
+  CopyMem (NewOption->Data, BootFileUrl, BootFileUrlLen);
+  NewOption->Data[BootFileUrlLen] = '\0';
+  NewOffset                     += sizeof (NewOption->OpCode) + sizeof (NewOption->OpLen) + BootFileUrlLen;
+  Dst->Length                    = sizeof (EFI_DHCP6_HEADER) + NewOffset;
+
+  return EFI_SUCCESS;
+}
+
+/**
   Parse the cached DHCPv6 packet, including all the options.
 
   @param[in]  Cache6           The pointer to a cached DHCPv6 packet.
+  @param[in]  AllowStatelessOffer
+                              TRUE if a stateless reply without BootFile URL is
+                              acceptable.
 
   @retval     EFI_SUCCESS      Parsed the DHCPv6 packet successfully.
   @retval     EFI_DEVICE_ERROR Failed to parse and invalid the packet.
@@ -169,7 +396,8 @@ HttpBootParseDhcp6Options (
 **/
 EFI_STATUS
 HttpBootParseDhcp6Packet (
-  IN  HTTP_BOOT_DHCP6_PACKET_CACHE  *Cache6
+  IN  HTTP_BOOT_DHCP6_PACKET_CACHE  *Cache6,
+  IN  BOOLEAN                       AllowStatelessOffer
   )
 {
   EFI_DHCP6_PACKET         *Offer;
@@ -184,6 +412,9 @@ HttpBootParseDhcp6Packet (
   EFI_STATUS               Status;
   UINT32                   Offset;
   UINT32                   Length;
+  UINT16                   OpLen;
+  UINT16                   VendorClassLen;
+  CHAR8                    *BootFileUrl;
 
   IsDnsOffer     = FALSE;
   IpExpressedUri = FALSE;
@@ -197,6 +428,9 @@ HttpBootParseDhcp6Packet (
   Option = (EFI_DHCP6_PACKET_OPTION *)(Offer->Dhcp6.Option);
   Offset = 0;
   Length = GET_DHCP6_OPTION_SIZE (Offer);
+  if (!HttpBootIsDhcp6OptionListValid (Offer->Dhcp6.Option, Length)) {
+    return EFI_DEVICE_ERROR;
+  }
 
   //
   // OpLen and OpCode here are both stored in network order, since they are from original packet.
@@ -217,7 +451,7 @@ HttpBootParseDhcp6Packet (
       Options[HTTP_BOOT_DHCP6_IDX_DNS_SERVER] = Option;
     }
 
-    Offset += (NTOHS (Option->OpLen) + 4);
+    Offset += (NTOHS (Option->OpLen) + sizeof (Option->OpCode) + sizeof (Option->OpLen));
     Option  = (EFI_DHCP6_PACKET_OPTION *)(Offer->Dhcp6.Option + Offset);
   }
 
@@ -227,12 +461,21 @@ HttpBootParseDhcp6Packet (
   //
   Option = Options[HTTP_BOOT_DHCP6_IDX_IA_NA];
   if (Option != NULL) {
+    OpLen = NTOHS (Option->OpLen);
+    if (OpLen < 12) {
+      return EFI_DEVICE_ERROR;
+    }
+
     Option = HttpBootParseDhcp6Options (
                Option->Data + 12,
-               NTOHS (Option->OpLen),
+               OpLen - 12,
                DHCP6_OPT_STATUS_CODE
                );
-    if (((Option != NULL) && (Option->Data[0] == 0)) || (Option == NULL)) {
+    if ((Option != NULL) && (NTOHS (Option->OpLen) < sizeof (UINT16))) {
+      return EFI_DEVICE_ERROR;
+    }
+
+    if (((Option != NULL) && (Option->Data[0] == 0) && (Option->Data[1] == 0)) || (Option == NULL)) {
       IsProxyOffer = FALSE;
     }
   }
@@ -243,7 +486,16 @@ HttpBootParseDhcp6Packet (
   Option = Options[HTTP_BOOT_DHCP6_IDX_VENDOR_CLASS];
 
   if ((Option != NULL) &&
+      (NTOHS (Option->OpLen) >= 16))
+  {
+    CopyMem (&VendorClassLen, Option->Data + 4, sizeof (UINT16));
+    VendorClassLen = NTOHS (VendorClassLen);
+  }
+
+  if ((Option != NULL) &&
       (NTOHS (Option->OpLen) >= 16) &&
+      (VendorClassLen >= 10) &&
+      (VendorClassLen <= NTOHS (Option->OpLen) - 6) &&
       (CompareMem ((Option->Data + 6), DEFAULT_CLASS_ID_DATA, 10) == 0))
   {
     IsHttpOffer = TRUE;
@@ -254,36 +506,63 @@ HttpBootParseDhcp6Packet (
   //
   Option = Options[HTTP_BOOT_DHCP6_IDX_DNS_SERVER];
   if (Option != NULL) {
+    OpLen = NTOHS (Option->OpLen);
+    if (((OpLen % sizeof (EFI_IPv6_ADDRESS)) != 0) || (OpLen == 0)) {
+      return EFI_DEVICE_ERROR;
+    }
+
     IsDnsOffer = TRUE;
   }
 
   //
   // Http offer must have a boot URI.
   //
-  if (IsHttpOffer && (Options[HTTP_BOOT_DHCP6_IDX_BOOT_FILE_URL] == NULL)) {
+  if (IsHttpOffer &&
+      (Options[HTTP_BOOT_DHCP6_IDX_BOOT_FILE_URL] == NULL) &&
+      !AllowStatelessOffer)
+  {
     return EFI_DEVICE_ERROR;
+  }
+
+  if (AllowStatelessOffer && (Options[HTTP_BOOT_DHCP6_IDX_BOOT_FILE_URL] == NULL)) {
+    IsHttpOffer  = FALSE;
+    IsProxyOffer = FALSE;
   }
 
   //
   // Try to retrieve the IP of HTTP server from URI.
   //
   if (IsHttpOffer) {
+    Option = Options[HTTP_BOOT_DHCP6_IDX_BOOT_FILE_URL];
+    OpLen  = NTOHS (Option->OpLen);
+    if (OpLen == 0) {
+      return EFI_DEVICE_ERROR;
+    }
+
+    BootFileUrl = AllocateZeroPool (OpLen + 1);
+    if (BootFileUrl == NULL) {
+      return EFI_OUT_OF_RESOURCES;
+    }
+
+    CopyMem (BootFileUrl, Option->Data, OpLen);
     Status = HttpParseUrl (
-               (CHAR8 *)Options[HTTP_BOOT_DHCP6_IDX_BOOT_FILE_URL]->Data,
-               (UINT32)AsciiStrLen ((CHAR8 *)Options[HTTP_BOOT_DHCP6_IDX_BOOT_FILE_URL]->Data),
+               BootFileUrl,
+               OpLen,
                FALSE,
                &Cache6->UriParser
                );
     if (EFI_ERROR (Status)) {
+      FreePool (BootFileUrl);
       return EFI_DEVICE_ERROR;
     }
 
     Status = HttpUrlGetIp6 (
-               (CHAR8 *)Options[HTTP_BOOT_DHCP6_IDX_BOOT_FILE_URL]->Data,
+               BootFileUrl,
                Cache6->UriParser,
                &IpAddr
                );
     IpExpressedUri = !EFI_ERROR (Status);
+    FreePool (BootFileUrl);
   }
 
   //
@@ -376,7 +655,7 @@ HttpBootCacheDhcp6Offer (
   //
   // Validate the DHCPv6 packet, and parse the options and offer type.
   //
-  if (EFI_ERROR (HttpBootParseDhcp6Packet (Cache6))) {
+  if (EFI_ERROR (HttpBootParseDhcp6Packet (Cache6, FALSE))) {
     return EFI_ABORTED;
   }
 
@@ -780,6 +1059,7 @@ HttpBootSetIp6Address (
   UINTN                          DataSize;
   BOOLEAN                        IsAddressOk;
   UINTN                          Index;
+  UINT8                          PrefixLength;
 
   ASSERT (Private->UsingIpv6);
 
@@ -790,8 +1070,15 @@ HttpBootSetIp6Address (
   Ip6         = Private->Ip6;
 
   ZeroMem (&CfgAddr, sizeof (EFI_IP6_CONFIG_MANUAL_ADDRESS));
-  CopyMem (&CfgAddr, &Private->StationIp.v6, sizeof (EFI_IPv6_ADDRESS));
+  CopyMem (&CfgAddr.Address, &Private->StationIp.v6, sizeof (EFI_IPv6_ADDRESS));
   ZeroMem (&Ip6CfgData, sizeof (EFI_IP6_CONFIG_DATA));
+
+  PrefixLength = 0;
+  Status       = HttpBootGetSlaacPrefixLength (Private, &Private->StationIp.v6, &PrefixLength);
+  if (!EFI_ERROR (Status) && (PrefixLength != 0)) {
+    CfgAddr.PrefixLength = PrefixLength;
+    AsciiPrint ("\n  SLAAC: preserving station prefix length /%d for manual IPv6 setup.\n", PrefixLength);
+  }
 
   Ip6CfgData.AcceptIcmpErrors = TRUE;
   Ip6CfgData.DefaultProtocol  = IP6_ICMP;
@@ -1007,6 +1294,562 @@ HandleDhcp6NoMappingRetry (
 }
 
 /**
+  Check whether an IPv6 address is usable for SLAAC HTTP boot.
+
+  @param[in]  Ip6Addr       The IPv6 address to check.
+
+  @retval     TRUE          The address is usable.
+  @retval     FALSE         The address is not usable.
+
+**/
+STATIC
+BOOLEAN
+HttpBootIsUsableSlaacAddress (
+  IN EFI_IPv6_ADDRESS  *Ip6Addr
+  )
+{
+  EFI_IPv6_ADDRESS  Loopback;
+
+  ZeroMem (&Loopback, sizeof (Loopback));
+  Loopback.Addr[15] = 1;
+
+  if (NetIp6IsUnspecifiedAddr (Ip6Addr) ||
+      NetIp6IsLinkLocalAddr (Ip6Addr)   ||
+      !NetIp6IsValidUnicast (Ip6Addr)   ||
+      EFI_IP6_EQUAL (Ip6Addr, &Loopback))
+  {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+  Retrieve the first usable non-link-local IPv6 address on the interface.
+
+  @param[in]  Private       The pointer to HTTP BOOT driver private data.
+  @param[out] Ip6Addr       The usable IPv6 address.
+
+  @retval     EFI_SUCCESS   A usable IPv6 address was found.
+  @retval     EFI_NOT_FOUND No usable IPv6 address is available.
+  @retval     Others        Unexpected error happened.
+
+**/
+STATIC
+EFI_STATUS
+HttpBootGetSlaacAddress (
+  IN  HTTP_BOOT_PRIVATE_DATA  *Private,
+  OUT EFI_IPv6_ADDRESS        *Ip6Addr,
+  OUT UINT8                   *PrefixLength OPTIONAL
+  )
+{
+  EFI_IP6_CONFIG_PROTOCOL        *Ip6Config;
+  EFI_IP6_CONFIG_INTERFACE_INFO  *IfInfo;
+  EFI_STATUS                     Status;
+  UINTN                          DataSize;
+  UINTN                          Index;
+
+  Ip6Config = Private->Ip6Config;
+  IfInfo    = NULL;
+  DataSize  = 0;
+
+  Status = Ip6Config->GetData (
+                        Ip6Config,
+                        Ip6ConfigDataTypeInterfaceInfo,
+                        &DataSize,
+                        NULL
+                        );
+  if (Status != EFI_BUFFER_TOO_SMALL) {
+    return EFI_NOT_FOUND;
+  }
+
+  IfInfo = AllocateZeroPool (DataSize);
+  if (IfInfo == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = Ip6Config->GetData (
+                        Ip6Config,
+                        Ip6ConfigDataTypeInterfaceInfo,
+                        &DataSize,
+                        IfInfo
+                        );
+  if (EFI_ERROR (Status)) {
+    goto ON_EXIT;
+  }
+
+  Status = EFI_NOT_FOUND;
+  for (Index = 0; Index < IfInfo->AddressInfoCount; Index++) {
+    if (HttpBootIsUsableSlaacAddress (&IfInfo->AddressInfo[Index].Address)) {
+      CopyMem (Ip6Addr, &IfInfo->AddressInfo[Index].Address, sizeof (EFI_IPv6_ADDRESS));
+      if (PrefixLength != NULL) {
+        *PrefixLength = IfInfo->AddressInfo[Index].PrefixLength;
+      }
+
+      Status = EFI_SUCCESS;
+      break;
+    }
+  }
+
+ON_EXIT:
+  if (IfInfo != NULL) {
+    FreePool (IfInfo);
+  }
+
+  return Status;
+}
+
+/**
+  Retrieve the prefix length for an already discovered SLAAC IPv6 address.
+
+  @param[in]  Private       The pointer to HTTP BOOT driver private data.
+  @param[in]  Ip6Addr       The IPv6 address to look up.
+  @param[out] PrefixLength  The prefix length associated with Ip6Addr.
+
+  @retval     EFI_SUCCESS   The prefix length was found.
+  @retval     EFI_NOT_FOUND The address is not present in interface information.
+  @retval     Others        Unexpected error happened.
+
+**/
+STATIC
+EFI_STATUS
+HttpBootGetSlaacPrefixLength (
+  IN  HTTP_BOOT_PRIVATE_DATA  *Private,
+  IN  EFI_IPv6_ADDRESS        *Ip6Addr,
+  OUT UINT8                   *PrefixLength
+  )
+{
+  EFI_IP6_CONFIG_PROTOCOL        *Ip6Config;
+  EFI_IP6_CONFIG_INTERFACE_INFO  *IfInfo;
+  EFI_STATUS                     Status;
+  UINTN                          DataSize;
+  UINTN                          Index;
+
+  if ((Ip6Addr == NULL) || (PrefixLength == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Ip6Config = Private->Ip6Config;
+  IfInfo    = NULL;
+  DataSize  = 0;
+
+  Status = Ip6Config->GetData (
+                        Ip6Config,
+                        Ip6ConfigDataTypeInterfaceInfo,
+                        &DataSize,
+                        NULL
+                        );
+  if (Status != EFI_BUFFER_TOO_SMALL) {
+    return EFI_NOT_FOUND;
+  }
+
+  IfInfo = AllocateZeroPool (DataSize);
+  if (IfInfo == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = Ip6Config->GetData (
+                        Ip6Config,
+                        Ip6ConfigDataTypeInterfaceInfo,
+                        &DataSize,
+                        IfInfo
+                        );
+  if (EFI_ERROR (Status)) {
+    goto ON_EXIT;
+  }
+
+  Status = EFI_NOT_FOUND;
+  for (Index = 0; Index < IfInfo->AddressInfoCount; Index++) {
+    if (EFI_IP6_EQUAL (Ip6Addr, &IfInfo->AddressInfo[Index].Address)) {
+      *PrefixLength = IfInfo->AddressInfo[Index].PrefixLength;
+      Status        = EFI_SUCCESS;
+      break;
+    }
+  }
+
+ON_EXIT:
+  if (IfInfo != NULL) {
+    FreePool (IfInfo);
+  }
+
+  return Status;
+}
+
+/**
+  Get the latest Router Advertisement M/O flag information if available.
+
+  @param[in]  Private       The pointer to HTTP BOOT driver private data.
+  @param[out] RaInfo        The latest Router Advertisement information.
+
+  @retval     EFI_SUCCESS   Router Advertisement information is returned.
+  @retval     EFI_NOT_READY No valid Router Advertisement has been received.
+  @retval     Others        Router Advertisement information is unavailable.
+
+**/
+STATIC
+EFI_STATUS
+HttpBootGetLatestRaInfo (
+  IN  HTTP_BOOT_PRIVATE_DATA  *Private,
+  OUT EDKII_IP6_RA_INFO       *RaInfo
+  )
+{
+  EDKII_IP6_RA_INFO_PROTOCOL  *RaInfoProtocol;
+  EFI_STATUS                  Status;
+
+  if ((Private == NULL) || (RaInfo == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  RaInfoProtocol = NULL;
+  Status         = gBS->HandleProtocol (
+                          Private->Controller,
+                          &gEdkiiIp6RaInfoProtocolGuid,
+                          (VOID **)&RaInfoProtocol
+                          );
+  if (EFI_ERROR (Status) || (RaInfoProtocol == NULL)) {
+    return EFI_ERROR (Status) ? Status : EFI_NOT_FOUND;
+  }
+
+  return RaInfoProtocol->GetLatestRaInfo (RaInfoProtocol, RaInfo);
+}
+
+/**
+  Print the latest Router Advertisement M/O flag information if available.
+
+  @param[in]  Private       The pointer to HTTP BOOT driver private data.
+
+**/
+STATIC
+VOID
+HttpBootPrintLatestRaInfo (
+  IN HTTP_BOOT_PRIVATE_DATA  *Private
+  )
+{
+  EDKII_IP6_RA_INFO  RaInfo;
+  EFI_STATUS         Status;
+
+  Status = HttpBootGetLatestRaInfo (Private, &RaInfo);
+  if (Status == EFI_NOT_READY) {
+    AsciiPrint ("  RA: not received.\n");
+    return;
+  }
+
+  if (EFI_ERROR (Status)) {
+    AsciiPrint ("  RA: unavailable: %r.\n", Status);
+    return;
+  }
+
+  AsciiPrint (
+    "  RA: M=%d, O=%d\n",
+    RaInfo.ManagedFlag ? 1 : 0,
+    RaInfo.OtherConfigFlag ? 1 : 0
+    );
+}
+
+/**
+  Wait for a usable SLAAC address already configured on the interface.
+
+  @param[in]  Private       The pointer to HTTP BOOT driver private data.
+  @param[out] StationIp     The usable SLAAC station IPv6 address.
+
+  @retval     EFI_SUCCESS   SLAAC HTTP boot conditions are met.
+  @retval     Others        SLAAC path is not applicable.
+
+**/
+STATIC
+EFI_STATUS
+HttpBootDhcp6DiscoverSlaac (
+  IN  HTTP_BOOT_PRIVATE_DATA  *Private,
+  OUT EFI_IPv6_ADDRESS        *StationIp
+  )
+{
+  EDKII_IP6_RA_INFO                 RaInfo;
+  EFI_STATUS                        Status;
+  HTTP_BOOT_DHCP6_SLAAC_DECISION    Decision;
+  UINTN                             RetryCount;
+  UINT8                             PrefixLength;
+
+  RetryCount   = 0;
+  PrefixLength = 0;
+  Decision     = HttpBootDhcp6SlaacDecisionWait;
+  ZeroMem (StationIp, sizeof (EFI_IPv6_ADDRESS));
+
+  AsciiPrint ("\n  SLAAC: waiting for RA M=0/O=1 and configured non-link-local address.\n");
+
+  while (RetryCount < HTTP_BOOT_DHCP6_SLAAC_DISCOVER_TIMEOUT * 10) {
+    if ((RetryCount % 10) == 0) {
+      AsciiPrint (
+        "\n  SLAAC: wait loop %d/%d, checking RA and configured addresses.\n",
+        RetryCount / 10,
+        HTTP_BOOT_DHCP6_SLAAC_DISCOVER_TIMEOUT
+        );
+      HttpBootPrintLatestRaInfo (Private);
+    }
+
+    if (Decision == HttpBootDhcp6SlaacDecisionWait) {
+      Status = HttpBootGetLatestRaInfo (Private, &RaInfo);
+      if (Status == EFI_NOT_READY) {
+        gBS->Stall (100 * 1000);
+        RetryCount++;
+        continue;
+      }
+
+      if (EFI_ERROR (Status)) {
+        AsciiPrint ("\n  SLAAC: RA information unavailable: %r.\n", Status);
+        return Status;
+      }
+
+      if (RaInfo.ManagedFlag) {
+        AsciiPrint ("\n  SLAAC: RA M=1, falling back to DHCPv6 SARR.\n");
+        return EFI_UNSUPPORTED;
+      }
+
+      if (!RaInfo.OtherConfigFlag) {
+        AsciiPrint ("\n  SLAAC: RA O=0, falling back to DHCPv6 SARR.\n");
+        return EFI_UNSUPPORTED;
+      }
+
+      Decision = HttpBootDhcp6SlaacDecisionTryInfoRequest;
+    }
+
+    Status = HttpBootGetSlaacAddress (Private, StationIp, &PrefixLength);
+    if (!EFI_ERROR (Status)) {
+      AsciiPrint ("\n  SLAAC: station address ready from IPv6 configuration: ");
+      HttpBootShowIp6Addr (StationIp);
+      AsciiPrint ("/%d.\n", PrefixLength);
+      return EFI_SUCCESS;
+    }
+
+    if (Status != EFI_NOT_FOUND) {
+      AsciiPrint ("\n  SLAAC: failed to check station address: %r.\n", Status);
+      return Status;
+    }
+
+    gBS->Stall (100 * 1000);
+    RetryCount++;
+  }
+
+  if (Decision == HttpBootDhcp6SlaacDecisionWait) {
+    AsciiPrint ("\n  SLAAC: timeout waiting for Router Advertisement.\n");
+  } else {
+    AsciiPrint ("\n  SLAAC: timeout waiting for usable address.\n");
+  }
+
+  return EFI_TIMEOUT;
+}
+
+/**
+  DHCPv6 Information Request reply callback for SLAAC HTTP boot.
+
+  @param[in]  This              The pointer to the EFI DHCPv6 Protocol.
+  @param[in]  Context           Pointer to the callback context.
+  @param[in]  Packet            The received Reply packet.
+
+  @retval EFI_SUCCESS           Accept the reply and finish Information Request.
+  @retval EFI_NOT_READY         Ignore this reply and keep waiting.
+  @retval EFI_OUT_OF_RESOURCES  There are not enough resources.
+
+**/
+STATIC
+EFI_STATUS
+EFIAPI
+HttpBootDhcp6InfoRequestCallback (
+  IN EFI_DHCP6_PROTOCOL  *This,
+  IN VOID                *Context,
+  IN EFI_DHCP6_PACKET    *Packet
+  )
+{
+  HTTP_BOOT_DHCP6_INFO_REQUEST_CONTEXT  *RequestContext;
+  HTTP_BOOT_PRIVATE_DATA                *Private;
+  HTTP_BOOT_DHCP6_PACKET_CACHE          *Cache6;
+  EFI_STATUS                            Status;
+  HTTP_BOOT_OFFER_TYPE                  OfferType;
+
+  (VOID)This;
+
+  if ((Context == NULL) || (Packet == NULL) || (Packet->Dhcp6.Header.MessageType != Dhcp6MsgReply)) {
+    return EFI_NOT_READY;
+  }
+
+  RequestContext = (HTTP_BOOT_DHCP6_INFO_REQUEST_CONTEXT *)Context;
+  Private        = RequestContext->Private;
+  Cache6         = &Private->OfferBuffer[0].Dhcp6;
+
+  HttpBootDhcp6ClearOfferState (Private);
+  Cache6->Packet.Offer.Size = HTTP_CACHED_DHCP6_PACKET_MAX_SIZE;
+
+  Status = HttpBootCacheDhcp6InfoReply (
+             &Cache6->Packet.Offer,
+             Packet,
+             (BOOLEAN)(Private->FilePathUri == NULL)
+             );
+  if (EFI_ERROR (Status)) {
+    return EFI_NOT_READY;
+  }
+
+  Status = HttpBootParseDhcp6Packet (
+             Cache6,
+             (BOOLEAN)(Private->FilePathUri != NULL)
+             );
+  if (EFI_ERROR (Status)) {
+    if (Cache6->UriParser != NULL) {
+      HttpUrlFreeParser (Cache6->UriParser);
+      Cache6->UriParser = NULL;
+    }
+
+    return (Status == EFI_OUT_OF_RESOURCES) ? Status : EFI_NOT_READY;
+  }
+
+  OfferType = Cache6->OfferType;
+  if (OfferType == HttpOfferTypeProxyIpUri) {
+    OfferType = (Cache6->OptList[HTTP_BOOT_DHCP6_IDX_DNS_SERVER] != NULL) ? HttpOfferTypeDhcpIpUriDns : HttpOfferTypeDhcpIpUri;
+  } else if (OfferType == HttpOfferTypeProxyNameUri) {
+    OfferType = (Cache6->OptList[HTTP_BOOT_DHCP6_IDX_DNS_SERVER] != NULL) ? HttpOfferTypeDhcpNameUriDns : HttpOfferTypeDhcpNameUri;
+  } else if ((Private->FilePathUri != NULL) &&
+             (OfferType != HttpOfferTypeDhcpDns) &&
+             (OfferType != HttpOfferTypeDhcpIpUriDns) &&
+             (OfferType != HttpOfferTypeDhcpNameUriDns) &&
+             (OfferType != HttpOfferTypeDhcpOnly) &&
+             (OfferType != HttpOfferTypeDhcpIpUri))
+  {
+    if (Cache6->UriParser != NULL) {
+      HttpUrlFreeParser (Cache6->UriParser);
+      Cache6->UriParser = NULL;
+    }
+
+    return EFI_NOT_READY;
+  } else if ((Private->FilePathUri == NULL) &&
+             (OfferType != HttpOfferTypeDhcpIpUri) &&
+             (OfferType != HttpOfferTypeDhcpIpUriDns) &&
+             (OfferType != HttpOfferTypeDhcpNameUriDns))
+  {
+    if (Cache6->UriParser != NULL) {
+      HttpUrlFreeParser (Cache6->UriParser);
+      Cache6->UriParser = NULL;
+    }
+
+    return EFI_NOT_READY;
+  }
+
+  Cache6->OfferType = OfferType;
+  ASSERT (OfferType < HttpOfferTypeMax);
+
+  Private->OfferNum                  = 1;
+  Private->OfferCount[OfferType]     = 1;
+  Private->OfferIndex[OfferType][0]  = 0;
+  RequestContext->Accepted           = TRUE;
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Try IPv6 HTTP Boot with SLAAC address assignment and DHCPv6 Information Request.
+
+  @param[in]  Private           Pointer to HTTP_BOOT private data.
+
+  @retval EFI_SUCCESS           The SLAAC Information Request path succeeded.
+  @retval Others                The caller may fall back to SARR.
+
+**/
+STATIC
+EFI_STATUS
+HttpBootDhcp6TrySlaacInfoRequest (
+  IN HTTP_BOOT_PRIVATE_DATA  *Private
+  )
+{
+  EFI_DHCP6_PROTOCOL                    *Dhcp6;
+  EFI_DHCP6_RETRANSMISSION              Retransmit;
+  EFI_DHCP6_PACKET_OPTION               *OptList[HTTP_BOOT_DHCP6_OPTION_MAX_NUM];
+  HTTP_BOOT_DHCP6_INFO_REQUEST_CONTEXT  RequestContext;
+  HTTP_BOOT_DHCP6_PACKET_CACHE          *Cache6;
+  EFI_DHCP6_PACKET_OPTION               *BootFileUrl;
+  UINT32                                OptCount;
+  UINT8                                 Buffer[HTTP_BOOT_DHCP6_OPTION_MAX_SIZE];
+  EFI_STATUS                            Status;
+
+  Dhcp6 = Private->Dhcp6;
+  ASSERT (Dhcp6 != NULL);
+
+  Status = HttpBootDhcp6DiscoverSlaac (Private, &Private->StationIp.v6);
+  if (EFI_ERROR (Status)) {
+    ZeroMem (&Private->StationIp.v6, sizeof (EFI_IPv6_ADDRESS));
+    HttpBootDhcp6ClearOfferState (Private);
+    Dhcp6->Configure (Dhcp6, NULL);
+    return Status;
+  }
+
+  HttpBootDhcp6ClearOfferState (Private);
+
+  OptCount = HttpBootBuildDhcp6Options (Private, OptList, Buffer);
+  ASSERT (OptCount > 1);
+
+  ZeroMem (&Retransmit, sizeof (Retransmit));
+  Retransmit.Irt = 4;
+  Retransmit.Mrc = 2;
+  Retransmit.Mrt = 4;
+  Retransmit.Mrd = HTTP_BOOT_DHCP6_INFO_REQ_TIMEOUT;
+
+  ZeroMem (&RequestContext, sizeof (RequestContext));
+  RequestContext.Private = Private;
+
+  Status = Dhcp6->InfoRequest (
+                    Dhcp6,
+                    TRUE,
+                    OptList[0],
+                    OptCount - 1,
+                    &OptList[1],
+                    &Retransmit,
+                    NULL,
+                    HttpBootDhcp6InfoRequestCallback,
+                    &RequestContext
+                    );
+  if (EFI_ERROR (Status) || !RequestContext.Accepted) {
+    AsciiPrint ("\n  SLAAC: DHCPv6 Information Request did not return HTTP boot information: %r.\n", Status);
+    Status = EFI_DEVICE_ERROR;
+    goto ON_ERROR;
+  }
+
+  HttpBootSelectDhcpOffer (Private);
+  if (Private->SelectIndex == 0) {
+    AsciiPrint ("\n  SLAAC: no usable HTTP boot offer after Information Request.\n");
+    Status = EFI_NOT_FOUND;
+    goto ON_ERROR;
+  }
+
+  Cache6      = &Private->OfferBuffer[Private->SelectIndex - 1].Dhcp6;
+  BootFileUrl = Cache6->OptList[HTTP_BOOT_DHCP6_IDX_BOOT_FILE_URL];
+  if (Private->FilePathUri == NULL) {
+    if (BootFileUrl == NULL) {
+      AsciiPrint ("\n  SLAAC: selected offer does not include BootFile URL.\n");
+      Status = EFI_NOT_FOUND;
+      goto ON_ERROR;
+    }
+
+    Status = HttpBootCheckUriScheme ((CHAR8 *)BootFileUrl->Data);
+  } else {
+    Status = HttpBootCheckUriScheme (Private->FilePathUri);
+  }
+
+  if (EFI_ERROR (Status)) {
+    AsciiPrint ("\n  SLAAC: Boot URI scheme check failed: %r.\n", Status);
+    goto ON_ERROR;
+  }
+
+  AsciiPrint ("\n  Station IPv6 address is ");
+  HttpBootShowIp6Addr (&Private->StationIp.v6);
+  AsciiPrint ("\n");
+
+  return EFI_SUCCESS;
+
+ON_ERROR:
+  HttpBootDhcp6ClearOfferState (Private);
+  ZeroMem (&Private->StationIp.v6, sizeof (EFI_IPv6_ADDRESS));
+
+  Dhcp6->Configure (Dhcp6, NULL);
+  return Status;
+}
+
+/**
   Start the S.A.R.R DHCPv6 process to acquire the IPv6 address and other Http boot information.
 
   @param[in]  Private           Pointer to HTTP_BOOT private data.
@@ -1036,6 +1879,11 @@ HttpBootDhcp6Sarr (
 
   ASSERT (Private->UsingIpv6);
   Ip6Cfg = Private->Ip6Config;
+
+  Status = HttpBootDhcp6TrySlaacInfoRequest (Private);
+  if (!EFI_ERROR (Status)) {
+    return EFI_SUCCESS;
+  }
 
   //
   // Build options list for the request packet.

@@ -1957,6 +1957,8 @@ Ip6ProcessRouterAdvertise (
   UINT8                      CurHopLimit;
   BOOLEAN                    Mflag;
   BOOLEAN                    Oflag;
+  BOOLEAN                    RawMflag;
+  BOOLEAN                    RawOflag;
   IP6_DEFAULT_ROUTER         *DefaultRouter;
   IP6_NEIGHBOR_ENTRY         *NeighborCache;
   EFI_MAC_ADDRESS            LinkLayerAddress;
@@ -2064,15 +2066,11 @@ Ip6ProcessRouterAdvertise (
     IpSb->CurHopLimit = CurHopLimit;
   }
 
-  Mflag = FALSE;
-  Oflag = FALSE;
-  if ((*((UINT8 *)&Fourth + 2) & IP6_M_ADDR_CONFIG_FLAG) == IP6_M_ADDR_CONFIG_FLAG) {
-    Mflag = TRUE;
-  } else {
-    if ((*((UINT8 *)&Fourth + 2) & IP6_O_CONFIG_FLAG) == IP6_O_CONFIG_FLAG) {
-      Oflag = TRUE;
-    }
-  }
+  RawMflag = ((*((UINT8 *)&Fourth + 2) & IP6_M_ADDR_CONFIG_FLAG) == IP6_M_ADDR_CONFIG_FLAG);
+  RawOflag = ((*((UINT8 *)&Fourth + 2) & IP6_O_CONFIG_FLAG) == IP6_O_CONFIG_FLAG);
+
+  Mflag = RawMflag;
+  Oflag = (BOOLEAN)(!RawMflag && RawOflag);
 
   if (Mflag || Oflag) {
     //
@@ -2116,7 +2114,9 @@ Ip6ProcessRouterAdvertise (
   //
   // If an valid router advertisement is received, stops router solicitation.
   //
-  IpSb->RouterAdvertiseReceived = TRUE;
+  IpSb->RouterAdvertiseReceived        = TRUE;
+  IpSb->RouterAdvertiseManagedFlag     = RawMflag;
+  IpSb->RouterAdvertiseOtherConfigFlag = RawOflag;
 
   //
   // The only defined options that may appear are the Source
