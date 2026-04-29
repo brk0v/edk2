@@ -77,6 +77,7 @@
   gEfiIp6ServiceBindingProtocolGuid                    ## TO_START
   gEfiIp6ProtocolGuid                                  ## TO_START
   gEfiIp6ConfigProtocolGuid                            ## TO_START
+  gEdkiiIp6RaInfoProtocolGuid                          ## SOMETIMES_CONSUMES
   gEfiUdp4ServiceBindingProtocolGuid                   ## TO_START
   gEfiUdp4ProtocolGuid                                 ## TO_START
   gEfiMtftp4ServiceBindingProtocolGuid                 ## TO_START

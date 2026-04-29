@@ -21,6 +21,7 @@
 #include <Protocol/Ip4Config2.h>
 #include <Protocol/Ip6.h>
 #include <Protocol/Ip6Config.h>
+#include <Protocol/Ip6RaInfo.h>
 #include <Protocol/Udp4.h>
 #include <Protocol/Udp6.h>
 #include <Protocol/Dhcp4.h>
