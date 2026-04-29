@@ -41,6 +41,7 @@ VERSION_STRING = 1.0
   gEfiDhcp6ServiceBindingProtocolGuid
   gEfiDns6ServiceBindingProtocolGuid
   gEfiDns6ProtocolGuid
+  gEdkiiIp6RaInfoProtocolGuid
 
 [Pcd]
   gEfiNetworkPkgTokenSpaceGuid.PcdDhcp6UidType

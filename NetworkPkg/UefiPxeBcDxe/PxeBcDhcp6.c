@@ -11,6 +11,19 @@
 
 #include "PxeBcImpl.h"
 
+#define PXEBC_DHCP6_SLAAC_DISCOVER_TIMEOUT  6
+#define PXEBC_DHCP6_INFO_REQ_TIMEOUT        6
+
+typedef struct {
+  PXEBC_PRIVATE_DATA    *Private;
+  BOOLEAN               Accepted;
+} PXEBC_DHCP6_INFO_REQUEST_CONTEXT;
+
+typedef enum {
+  PxeBcDhcp6SlaacDecisionWait,
+  PxeBcDhcp6SlaacDecisionTryInfoRequest
+} PXEBC_DHCP6_SLAAC_DECISION;
+
 //
 // Well-known multi-cast address defined in section-24.1 of rfc-3315
 //
@@ -19,6 +32,148 @@
 EFI_IPv6_ADDRESS  mAllDhcpRelayAndServersAddress = {
   { 0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2 }
 };
+
+STATIC
+EFI_STATUS
+PxeBcGetSlaacPrefixLength (
+  IN  PXEBC_PRIVATE_DATA  *Private,
+  IN  EFI_IPv6_ADDRESS    *Ip6Addr,
+  OUT UINT8               *PrefixLength
+  );
+
+EFI_STATUS
+PxeBcCacheDhcp6Packet (
+  IN EFI_DHCP6_PACKET  *Dst,
+  IN EFI_DHCP6_PACKET  *Src
+  );
+
+/**
+  Validate that a DHCPv6 option buffer is well-formed.
+
+  @param[in]  Buffer        The pointer to the option buffer.
+  @param[in]  Length        Length of the option buffer.
+
+  @retval     TRUE          The option buffer is well-formed.
+  @retval     FALSE         The option buffer is malformed.
+
+**/
+STATIC
+BOOLEAN
+PxeBcIsDhcp6OptionListValid (
+  IN UINT8   *Buffer,
+  IN UINT32  Length
+  )
+{
+  EFI_DHCP6_PACKET_OPTION  *Option;
+  UINT32                   Offset;
+  UINT16                   OpLen;
+
+  if ((Buffer == NULL) && (Length != 0)) {
+    return FALSE;
+  }
+
+  Offset = 0;
+  while (Offset < Length) {
+    if (Length - Offset < sizeof (Option->OpCode) + sizeof (Option->OpLen)) {
+      return FALSE;
+    }
+
+    Option = (EFI_DHCP6_PACKET_OPTION *)(Buffer + Offset);
+    OpLen  = NTOHS (Option->OpLen);
+    Offset += sizeof (Option->OpCode) + sizeof (Option->OpLen);
+
+    if (OpLen > Length - Offset) {
+      return FALSE;
+    }
+
+    Offset += OpLen;
+  }
+
+  return TRUE;
+}
+
+/**
+  Clear DHCPv6 offer selection state for PXE.
+
+  @param[in]  Private       The pointer to PXEBC private data.
+
+**/
+STATIC
+VOID
+PxeBcDhcp6ClearOfferState (
+  IN PXEBC_PRIVATE_DATA  *Private
+  )
+{
+  UINTN  Index;
+
+  ZeroMem (Private->OfferBuffer, sizeof (Private->OfferBuffer));
+  for (Index = 0; Index < PXEBC_OFFER_MAX_NUM; Index++) {
+    Private->OfferBuffer[Index].Dhcp6.Packet.Offer.Size = PXEBC_CACHED_DHCP6_PACKET_MAX_SIZE;
+  }
+
+  Private->IsProxyRecved  = FALSE;
+  Private->OfferNum       = 0;
+  Private->SelectIndex    = 0;
+  Private->SelectProxyType = PxeOfferTypeMax;
+  ZeroMem (Private->OfferCount, sizeof (Private->OfferCount));
+  ZeroMem (Private->OfferIndex, sizeof (Private->OfferIndex));
+}
+
+/**
+  Clear temporary state used by the SLAAC Information Request path.
+
+  @param[in]  Private       The pointer to PXEBC private data.
+
+**/
+STATIC
+VOID
+PxeBcDhcp6ClearSlaacState (
+  IN PXEBC_PRIVATE_DATA  *Private
+  )
+{
+  EFI_PXE_BASE_CODE_MODE  *Mode;
+
+  Mode = Private->PxeBc.Mode;
+
+  PxeBcDhcp6ClearOfferState (Private);
+
+  ZeroMem (&Private->TmpStationIp.v6, sizeof (EFI_IPv6_ADDRESS));
+  ZeroMem (&Private->StationIp.v6, sizeof (EFI_IPv6_ADDRESS));
+  ZeroMem (&Mode->StationIp.v6, sizeof (EFI_IPv6_ADDRESS));
+
+  ZeroMem (&Private->DhcpAck.Dhcp6, sizeof (Private->DhcpAck.Dhcp6));
+  Private->DhcpAck.Dhcp6.Packet.Ack.Size = PXEBC_CACHED_DHCP6_PACKET_MAX_SIZE;
+  ZeroMem (&Private->ProxyOffer.Dhcp6, sizeof (Private->ProxyOffer.Dhcp6));
+  Private->ProxyOffer.Dhcp6.Packet.Offer.Size = PXEBC_CACHED_DHCP6_PACKET_MAX_SIZE;
+  ZeroMem (&Private->PxeReply.Dhcp6, sizeof (Private->PxeReply.Dhcp6));
+  Private->PxeReply.Dhcp6.Packet.Ack.Size = PXEBC_CACHED_DHCP6_PACKET_MAX_SIZE;
+
+  if (Private->Dhcp6Request != NULL) {
+    FreePool (Private->Dhcp6Request);
+    Private->Dhcp6Request = NULL;
+  }
+
+  if (Private->DnsServer != NULL) {
+    FreePool (Private->DnsServer);
+    Private->DnsServer = NULL;
+  }
+
+  if (Private->BootFileName != NULL) {
+    FreePool (Private->BootFileName);
+    Private->BootFileName = NULL;
+  }
+
+  Private->BootFileSize = 0;
+  Private->SolicitTimes = 0;
+  Private->ElapsedTime  = 0;
+
+  Mode->DhcpDiscoverValid   = FALSE;
+  Mode->DhcpAckReceived     = FALSE;
+  Mode->ProxyOfferReceived  = FALSE;
+  Mode->PxeDiscoverValid    = FALSE;
+  Mode->PxeReplyReceived    = FALSE;
+  Mode->PxeBisReplyReceived = FALSE;
+}
 
 /**
   Parse out a DHCPv6 option by OptTag, and find the position in buffer.
@@ -40,23 +195,69 @@ PxeBcParseDhcp6Options (
 {
   EFI_DHCP6_PACKET_OPTION  *Option;
   UINT32                   Offset;
+  UINT16                   OpLen;
 
-  Option = (EFI_DHCP6_PACKET_OPTION *)Buffer;
   Offset = 0;
 
   //
   // OpLen and OpCode here are both stored in network order.
   //
   while (Offset < Length) {
+    if (Length - Offset < sizeof (Option->OpCode) + sizeof (Option->OpLen)) {
+      return NULL;
+    }
+
+    Option = (EFI_DHCP6_PACKET_OPTION *)(Buffer + Offset);
+    OpLen  = NTOHS (Option->OpLen);
+    Offset += sizeof (Option->OpCode) + sizeof (Option->OpLen);
+    if (OpLen > Length - Offset) {
+      return NULL;
+    }
+
     if (NTOHS (Option->OpCode) == OptTag) {
       return Option;
     }
 
-    Offset += (NTOHS (Option->OpLen) + 4);
-    Option  = (EFI_DHCP6_PACKET_OPTION *)(Buffer + Offset);
+    Offset += OpLen;
   }
 
   return NULL;
+}
+
+/**
+  Copy a DHCPv6 Information Reply into the cache.
+
+  @param[in]  Dst          The pointer to the cache buffer for DHCPv6 packet.
+  @param[in]  Src          The pointer to the DHCPv6 packet to be cached.
+
+  @retval     EFI_SUCCESS          Packet is copied.
+  @retval     EFI_DEVICE_ERROR     Packet is malformed or lacks BootFile URL.
+  @retval     EFI_BUFFER_TOO_SMALL Cache buffer is not big enough.
+
+**/
+STATIC
+EFI_STATUS
+PxeBcCacheDhcp6InfoReply (
+  IN EFI_DHCP6_PACKET  *Dst,
+  IN EFI_DHCP6_PACKET  *Src
+  )
+{
+  UINT32  OptionsLength;
+
+  if ((Dst == NULL) || (Src == NULL) || (Src->Length < sizeof (EFI_DHCP6_HEADER))) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  OptionsLength = GET_DHCP6_OPTION_SIZE (Src);
+  if (!PxeBcIsDhcp6OptionListValid (Src->Dhcp6.Option, OptionsLength)) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  if (PxeBcParseDhcp6Options (Src->Dhcp6.Option, OptionsLength, DHCP6_OPT_BOOT_FILE_URL) == NULL) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  return PxeBcCacheDhcp6Packet (Dst, Src);
 }
 
 /**
@@ -653,6 +854,9 @@ PxeBcParseDhcp6Packet (
   Option = (EFI_DHCP6_PACKET_OPTION *)(Offer->Dhcp6.Option);
   Offset = 0;
   Length = GET_DHCP6_OPTION_SIZE (Offer);
+  if (!PxeBcIsDhcp6OptionListValid (Offer->Dhcp6.Option, Length)) {
+    return EFI_DEVICE_ERROR;
+  }
 
   //
   // OpLen and OpCode here are both stored in network order, since they are from original packet.
@@ -683,12 +887,20 @@ PxeBcParseDhcp6Packet (
   //
   Option = Options[PXEBC_DHCP6_IDX_IA_NA];
   if (Option != NULL) {
+    if (NTOHS (Option->OpLen) < 12) {
+      return EFI_DEVICE_ERROR;
+    }
+
     Option = PxeBcParseDhcp6Options (
                Option->Data + 12,
-               NTOHS (Option->OpLen),
+               NTOHS (Option->OpLen) - 12,
                DHCP6_OPT_STATUS_CODE
                );
-    if (((Option != NULL) && (Option->Data[0] == 0)) || (Option == NULL)) {
+    if ((Option != NULL) && (NTOHS (Option->OpLen) < sizeof (UINT16))) {
+      return EFI_DEVICE_ERROR;
+    }
+
+    if (((Option != NULL) && (Option->Data[0] == 0) && (Option->Data[1] == 0)) || (Option == NULL)) {
       IsProxyOffer = FALSE;
     }
   }
@@ -705,6 +917,13 @@ PxeBcParseDhcp6Packet (
       (CompareMem (&Option->Data[6], DEFAULT_CLASS_ID_DATA, 9) == 0))
   {
     IsPxeOffer = TRUE;
+  }
+
+  Option = Options[PXEBC_DHCP6_IDX_DNS_SERVER];
+  if ((Option != NULL) &&
+      ((NTOHS (Option->OpLen) == 0) || ((NTOHS (Option->OpLen) % sizeof (EFI_IPv6_ADDRESS)) != 0)))
+  {
+    return EFI_DEVICE_ERROR;
   }
 
   //
@@ -1709,6 +1928,7 @@ PxeBcRegisterIp6Address (
   BOOLEAN                        NoGateway;
   EFI_IPv6_ADDRESS               *Ip6Addr;
   UINTN                          Index;
+  UINT8                          PrefixLength;
 
   MappedEvt = NULL;
   Ip6Addr   = NULL;
@@ -1719,6 +1939,13 @@ PxeBcRegisterIp6Address (
 
   ZeroMem (&CfgAddr, sizeof (EFI_IP6_CONFIG_MANUAL_ADDRESS));
   CopyMem (&CfgAddr.Address, Address, sizeof (EFI_IPv6_ADDRESS));
+
+  PrefixLength = 0;
+  Status       = PxeBcGetSlaacPrefixLength (Private, Address, &PrefixLength);
+  if (!EFI_ERROR (Status) && (PrefixLength != 0)) {
+    CfgAddr.PrefixLength = PrefixLength;
+    AsciiPrint ("\n  SLAAC: preserving station prefix length /%d for manual IPv6 setup.\n", PrefixLength);
+  }
 
   Status = Ip6->Configure (Ip6, &Private->Ip6CfgData);
   if (EFI_ERROR (Status)) {
@@ -1919,6 +2146,348 @@ PxeBcSetIp6Policy (
   }
 
   return Status;
+}
+
+/**
+  Check whether an IPv6 address is usable for SLAAC PXE boot.
+
+  @param[in]  Ip6Addr       The IPv6 address to check.
+
+  @retval     TRUE          The address is usable.
+  @retval     FALSE         The address is not usable.
+
+**/
+STATIC
+BOOLEAN
+PxeBcIsUsableSlaacAddress (
+  IN EFI_IPv6_ADDRESS  *Ip6Addr
+  )
+{
+  EFI_IPv6_ADDRESS  Loopback;
+
+  ZeroMem (&Loopback, sizeof (Loopback));
+  Loopback.Addr[15] = 1;
+
+  if (NetIp6IsUnspecifiedAddr (Ip6Addr) ||
+      NetIp6IsLinkLocalAddr (Ip6Addr)   ||
+      !NetIp6IsValidUnicast (Ip6Addr)   ||
+      EFI_IP6_EQUAL (Ip6Addr, &Loopback))
+  {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+  Retrieve the first usable non-link-local IPv6 address on the interface.
+
+  @param[in]  Private       The pointer to PXEBC private data.
+  @param[out] Ip6Addr       The usable IPv6 address.
+  @param[out] PrefixLength  The prefix length for Ip6Addr.
+
+  @retval     EFI_SUCCESS   A usable IPv6 address was found.
+  @retval     EFI_NOT_FOUND No usable IPv6 address is available.
+  @retval     Others        Unexpected error happened.
+
+**/
+STATIC
+EFI_STATUS
+PxeBcGetSlaacAddress (
+  IN  PXEBC_PRIVATE_DATA  *Private,
+  OUT EFI_IPv6_ADDRESS    *Ip6Addr,
+  OUT UINT8               *PrefixLength OPTIONAL
+  )
+{
+  EFI_IP6_CONFIG_INTERFACE_INFO  *IfInfo;
+  EFI_STATUS                     Status;
+  UINTN                          DataSize;
+  UINTN                          Index;
+
+  IfInfo   = NULL;
+  DataSize = 0;
+
+  Status = Private->Ip6Cfg->GetData (
+                              Private->Ip6Cfg,
+                              Ip6ConfigDataTypeInterfaceInfo,
+                              &DataSize,
+                              NULL
+                              );
+  if (Status != EFI_BUFFER_TOO_SMALL) {
+    return EFI_NOT_FOUND;
+  }
+
+  IfInfo = AllocateZeroPool (DataSize);
+  if (IfInfo == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = Private->Ip6Cfg->GetData (
+                              Private->Ip6Cfg,
+                              Ip6ConfigDataTypeInterfaceInfo,
+                              &DataSize,
+                              IfInfo
+                              );
+  if (EFI_ERROR (Status)) {
+    goto ON_EXIT;
+  }
+
+  Status = EFI_NOT_FOUND;
+  for (Index = 0; Index < IfInfo->AddressInfoCount; Index++) {
+    if (PxeBcIsUsableSlaacAddress (&IfInfo->AddressInfo[Index].Address)) {
+      CopyMem (Ip6Addr, &IfInfo->AddressInfo[Index].Address, sizeof (EFI_IPv6_ADDRESS));
+      if (PrefixLength != NULL) {
+        *PrefixLength = IfInfo->AddressInfo[Index].PrefixLength;
+      }
+
+      Status = EFI_SUCCESS;
+      break;
+    }
+  }
+
+ON_EXIT:
+  if (IfInfo != NULL) {
+    FreePool (IfInfo);
+  }
+
+  return Status;
+}
+
+/**
+  Retrieve the prefix length for an already discovered SLAAC IPv6 address.
+
+  @param[in]  Private       The pointer to PXEBC private data.
+  @param[in]  Ip6Addr       The IPv6 address to look up.
+  @param[out] PrefixLength  The prefix length associated with Ip6Addr.
+
+  @retval     EFI_SUCCESS   The prefix length was found.
+  @retval     EFI_NOT_FOUND The address is not present in interface information.
+  @retval     Others        Unexpected error happened.
+
+**/
+STATIC
+EFI_STATUS
+PxeBcGetSlaacPrefixLength (
+  IN  PXEBC_PRIVATE_DATA  *Private,
+  IN  EFI_IPv6_ADDRESS    *Ip6Addr,
+  OUT UINT8               *PrefixLength
+  )
+{
+  EFI_IP6_CONFIG_INTERFACE_INFO  *IfInfo;
+  EFI_STATUS                     Status;
+  UINTN                          DataSize;
+  UINTN                          Index;
+
+  if ((Private == NULL) || (Ip6Addr == NULL) || (PrefixLength == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  IfInfo   = NULL;
+  DataSize = 0;
+
+  Status = Private->Ip6Cfg->GetData (
+                              Private->Ip6Cfg,
+                              Ip6ConfigDataTypeInterfaceInfo,
+                              &DataSize,
+                              NULL
+                              );
+  if (Status != EFI_BUFFER_TOO_SMALL) {
+    return EFI_NOT_FOUND;
+  }
+
+  IfInfo = AllocateZeroPool (DataSize);
+  if (IfInfo == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = Private->Ip6Cfg->GetData (
+                              Private->Ip6Cfg,
+                              Ip6ConfigDataTypeInterfaceInfo,
+                              &DataSize,
+                              IfInfo
+                              );
+  if (EFI_ERROR (Status)) {
+    goto ON_EXIT;
+  }
+
+  Status = EFI_NOT_FOUND;
+  for (Index = 0; Index < IfInfo->AddressInfoCount; Index++) {
+    if (EFI_IP6_EQUAL (Ip6Addr, &IfInfo->AddressInfo[Index].Address)) {
+      *PrefixLength = IfInfo->AddressInfo[Index].PrefixLength;
+      Status        = EFI_SUCCESS;
+      break;
+    }
+  }
+
+ON_EXIT:
+  if (IfInfo != NULL) {
+    FreePool (IfInfo);
+  }
+
+  return Status;
+}
+
+/**
+  Get the latest Router Advertisement M/O flag information if available.
+
+  @param[in]  Private       The pointer to PXEBC private data.
+  @param[out] RaInfo        The latest Router Advertisement information.
+
+  @retval     EFI_SUCCESS   Router Advertisement information is returned.
+  @retval     EFI_NOT_READY No valid Router Advertisement has been received.
+  @retval     Others        Router Advertisement information is unavailable.
+
+**/
+STATIC
+EFI_STATUS
+PxeBcGetLatestRaInfo (
+  IN  PXEBC_PRIVATE_DATA  *Private,
+  OUT EDKII_IP6_RA_INFO   *RaInfo
+  )
+{
+  EDKII_IP6_RA_INFO_PROTOCOL  *RaInfoProtocol;
+  EFI_STATUS                  Status;
+
+  if ((Private == NULL) || (RaInfo == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  RaInfoProtocol = NULL;
+  Status         = gBS->HandleProtocol (
+                          Private->Controller,
+                          &gEdkiiIp6RaInfoProtocolGuid,
+                          (VOID **)&RaInfoProtocol
+                          );
+  if (EFI_ERROR (Status) || (RaInfoProtocol == NULL)) {
+    return EFI_ERROR (Status) ? Status : EFI_NOT_FOUND;
+  }
+
+  return RaInfoProtocol->GetLatestRaInfo (RaInfoProtocol, RaInfo);
+}
+
+/**
+  Print the latest Router Advertisement M/O flag information if available.
+
+  @param[in]  Private       The pointer to PXEBC private data.
+
+**/
+STATIC
+VOID
+PxeBcPrintLatestRaInfo (
+  IN PXEBC_PRIVATE_DATA  *Private
+  )
+{
+  EDKII_IP6_RA_INFO  RaInfo;
+  EFI_STATUS         Status;
+
+  Status = PxeBcGetLatestRaInfo (Private, &RaInfo);
+  if (Status == EFI_NOT_READY) {
+    AsciiPrint ("  RA: not received.\n");
+    return;
+  }
+
+  if (EFI_ERROR (Status)) {
+    AsciiPrint ("  RA: unavailable: %r.\n", Status);
+    return;
+  }
+
+  AsciiPrint (
+    "  RA: M=%d, O=%d\n",
+    RaInfo.ManagedFlag ? 1 : 0,
+    RaInfo.OtherConfigFlag ? 1 : 0
+    );
+}
+
+/**
+  Wait for a usable SLAAC address already configured on the interface.
+
+  @param[in]  Private       The pointer to PXEBC private data.
+  @param[out] StationIp     The usable SLAAC station IPv6 address.
+
+  @retval     EFI_SUCCESS   SLAAC PXE boot conditions are met.
+  @retval     Others        SLAAC path is not applicable.
+
+**/
+STATIC
+EFI_STATUS
+PxeBcDhcp6DiscoverSlaac (
+  IN  PXEBC_PRIVATE_DATA  *Private,
+  OUT EFI_IPv6_ADDRESS    *StationIp
+  )
+{
+  EDKII_IP6_RA_INFO             RaInfo;
+  EFI_STATUS                    Status;
+  PXEBC_DHCP6_SLAAC_DECISION    Decision;
+  UINTN                         RetryCount;
+  UINT8                         PrefixLength;
+
+  RetryCount   = 0;
+  PrefixLength = 0;
+  Decision     = PxeBcDhcp6SlaacDecisionWait;
+  ZeroMem (StationIp, sizeof (EFI_IPv6_ADDRESS));
+
+  AsciiPrint ("\n  SLAAC: waiting for RA M=0/O=1 and configured non-link-local address.\n");
+
+  while (RetryCount < PXEBC_DHCP6_SLAAC_DISCOVER_TIMEOUT * 10) {
+    if ((RetryCount % 10) == 0) {
+      AsciiPrint (
+        "\n  SLAAC: wait loop %d/%d, checking RA and configured addresses.\n",
+        RetryCount / 10,
+        PXEBC_DHCP6_SLAAC_DISCOVER_TIMEOUT
+        );
+      PxeBcPrintLatestRaInfo (Private);
+    }
+
+    if (Decision == PxeBcDhcp6SlaacDecisionWait) {
+      Status = PxeBcGetLatestRaInfo (Private, &RaInfo);
+      if (Status == EFI_NOT_READY) {
+        gBS->Stall (100 * 1000);
+        RetryCount++;
+        continue;
+      }
+
+      if (EFI_ERROR (Status)) {
+        AsciiPrint ("\n  SLAAC: RA information unavailable: %r.\n", Status);
+        return Status;
+      }
+
+      if (RaInfo.ManagedFlag) {
+        AsciiPrint ("\n  SLAAC: RA M=1, falling back to DHCPv6 SARR.\n");
+        return EFI_UNSUPPORTED;
+      }
+
+      if (!RaInfo.OtherConfigFlag) {
+        AsciiPrint ("\n  SLAAC: RA O=0, falling back to DHCPv6 SARR.\n");
+        return EFI_UNSUPPORTED;
+      }
+
+      Decision = PxeBcDhcp6SlaacDecisionTryInfoRequest;
+    }
+
+    Status = PxeBcGetSlaacAddress (Private, StationIp, &PrefixLength);
+    if (!EFI_ERROR (Status)) {
+      AsciiPrint ("\n  SLAAC: station address ready from IPv6 configuration: ");
+      PxeBcShowIp6Addr (StationIp);
+      AsciiPrint ("/%d.\n", PrefixLength);
+      return EFI_SUCCESS;
+    }
+
+    if (Status != EFI_NOT_FOUND) {
+      AsciiPrint ("\n  SLAAC: failed to check station address: %r.\n", Status);
+      return Status;
+    }
+
+    gBS->Stall (100 * 1000);
+    RetryCount++;
+  }
+
+  if (Decision == PxeBcDhcp6SlaacDecisionWait) {
+    AsciiPrint ("\n  SLAAC: timeout waiting for Router Advertisement.\n");
+  } else {
+    AsciiPrint ("\n  SLAAC: timeout waiting for usable address.\n");
+  }
+
+  return EFI_TIMEOUT;
 }
 
 /**
@@ -2321,6 +2890,182 @@ ON_ERROR:
 }
 
 /**
+  DHCPv6 Information Request reply callback for SLAAC PXE boot.
+
+  @param[in]  This              The pointer to the EFI DHCPv6 Protocol.
+  @param[in]  Context           Pointer to the callback context.
+  @param[in]  Packet            The received Reply packet.
+
+  @retval EFI_SUCCESS           Accept the reply and finish Information Request.
+  @retval EFI_NOT_READY         Ignore this reply and keep waiting.
+  @retval EFI_OUT_OF_RESOURCES  There are not enough resources.
+
+**/
+STATIC
+EFI_STATUS
+EFIAPI
+PxeBcDhcp6InfoRequestCallback (
+  IN EFI_DHCP6_PROTOCOL  *This,
+  IN VOID                *Context,
+  IN EFI_DHCP6_PACKET    *Packet
+  )
+{
+  PXEBC_DHCP6_INFO_REQUEST_CONTEXT  *RequestContext;
+  PXEBC_PRIVATE_DATA                *Private;
+  PXEBC_DHCP6_PACKET_CACHE          *Cache6;
+  EFI_STATUS                        Status;
+
+  (VOID)This;
+
+  if ((Context == NULL) || (Packet == NULL) || (Packet->Dhcp6.Header.MessageType != Dhcp6MsgReply)) {
+    return EFI_NOT_READY;
+  }
+
+  RequestContext = (PXEBC_DHCP6_INFO_REQUEST_CONTEXT *)Context;
+  Private        = RequestContext->Private;
+  Cache6         = &Private->OfferBuffer[0].Dhcp6;
+
+  PxeBcDhcp6ClearOfferState (Private);
+  Cache6->Packet.Offer.Size = PXEBC_CACHED_DHCP6_PACKET_MAX_SIZE;
+
+  Status = PxeBcCacheDhcp6InfoReply (&Cache6->Packet.Offer, Packet);
+  if (EFI_ERROR (Status)) {
+    PxeBcDhcp6ClearOfferState (Private);
+    return (Status == EFI_OUT_OF_RESOURCES) ? Status : EFI_NOT_READY;
+  }
+
+  Status = PxeBcParseDhcp6Packet (Cache6);
+  if (EFI_ERROR (Status)) {
+    PxeBcDhcp6ClearOfferState (Private);
+    return (Status == EFI_OUT_OF_RESOURCES) ? Status : EFI_NOT_READY;
+  }
+
+  if (Cache6->OptList[PXEBC_DHCP6_IDX_BOOT_FILE_URL] == NULL) {
+    PxeBcDhcp6ClearOfferState (Private);
+    return EFI_NOT_READY;
+  }
+
+  Status = PxeBcCacheDhcp6InfoReply (&Private->DhcpAck.Dhcp6.Packet.Ack, Packet);
+  if (EFI_ERROR (Status)) {
+    PxeBcDhcp6ClearOfferState (Private);
+    return (Status == EFI_OUT_OF_RESOURCES) ? Status : EFI_NOT_READY;
+  }
+
+  //
+  // A stateless Information Reply has no IA_NA, but it is the selected DHCP
+  // response for this path. Treat it as DHCP-only so existing PXE finalization
+  // does not retry it as a proxy BINL offer.
+  //
+  Cache6->OfferType = PxeOfferTypeDhcpOnly;
+
+  Private->OfferNum                                      = 1;
+  Private->OfferCount[PxeOfferTypeDhcpOnly]              = 1;
+  Private->OfferIndex[PxeOfferTypeDhcpOnly][0]           = 0;
+  Private->IsProxyRecved                                 = FALSE;
+  RequestContext->Accepted                               = TRUE;
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Try IPv6 PXE Boot with SLAAC address assignment and DHCPv6 Information Request.
+
+  @param[in]  Private           Pointer to PXEBC private data.
+  @param[in]  Dhcp6             The pointer to the EFI_DHCP6_PROTOCOL.
+
+  @retval EFI_SUCCESS           The SLAAC Information Request path succeeded.
+  @retval Others                The caller may fall back to SARR.
+
+**/
+STATIC
+EFI_STATUS
+PxeBcDhcp6TrySlaacInfoRequest (
+  IN PXEBC_PRIVATE_DATA  *Private,
+  IN EFI_DHCP6_PROTOCOL  *Dhcp6
+  )
+{
+  EFI_DHCP6_RETRANSMISSION          Retransmit;
+  EFI_DHCP6_PACKET_OPTION           *OptList[PXEBC_DHCP6_OPTION_MAX_NUM];
+  PXEBC_DHCP6_INFO_REQUEST_CONTEXT  RequestContext;
+  EFI_DHCP6_PACKET_OPTION           *BootFileUrl;
+  UINT32                            OptCount;
+  UINT8                             Buffer[PXEBC_DHCP6_OPTION_MAX_SIZE];
+  EFI_STATUS                        Status;
+
+  ASSERT (Dhcp6 != NULL);
+
+  PxeBcDhcp6ClearSlaacState (Private);
+
+  Status = PxeBcDhcp6DiscoverSlaac (Private, &Private->TmpStationIp.v6);
+  if (EFI_ERROR (Status)) {
+    PxeBcDhcp6ClearSlaacState (Private);
+    Dhcp6->Configure (Dhcp6, NULL);
+    return Status;
+  }
+
+  PxeBcDhcp6ClearOfferState (Private);
+
+  OptCount = PxeBcBuildDhcp6Options (Private, OptList, Buffer);
+  ASSERT (OptCount > 1);
+
+  ZeroMem (&Retransmit, sizeof (Retransmit));
+  Retransmit.Irt = 4;
+  Retransmit.Mrc = 2;
+  Retransmit.Mrt = 4;
+  Retransmit.Mrd = PXEBC_DHCP6_INFO_REQ_TIMEOUT;
+
+  ZeroMem (&RequestContext, sizeof (RequestContext));
+  RequestContext.Private = Private;
+
+  Status = Dhcp6->InfoRequest (
+                    Dhcp6,
+                    TRUE,
+                    OptList[0],
+                    OptCount - 1,
+                    &OptList[1],
+                    &Retransmit,
+                    NULL,
+                    PxeBcDhcp6InfoRequestCallback,
+                    &RequestContext
+                    );
+  if (EFI_ERROR (Status) || !RequestContext.Accepted) {
+    AsciiPrint ("\n  SLAAC: DHCPv6 Information Request did not return PXE boot information: %r.\n", Status);
+    Status = EFI_DEVICE_ERROR;
+    goto ON_ERROR;
+  }
+
+  PxeBcSelectDhcp6Offer (Private);
+  if (Private->SelectIndex == 0) {
+    AsciiPrint ("\n  SLAAC: no usable PXE boot offer after Information Request.\n");
+    Status = EFI_NOT_FOUND;
+    goto ON_ERROR;
+  }
+
+  BootFileUrl = Private->OfferBuffer[Private->SelectIndex - 1].Dhcp6.OptList[PXEBC_DHCP6_IDX_BOOT_FILE_URL];
+  if (BootFileUrl == NULL) {
+    AsciiPrint ("\n  SLAAC: selected offer does not include BootFile URL.\n");
+    Status = EFI_NOT_FOUND;
+    goto ON_ERROR;
+  }
+
+  Status = PxeBcHandleDhcp6Offer (Private);
+  if (EFI_ERROR (Status)) {
+    goto ON_ERROR;
+  }
+
+  AsciiPrint ("\n  Station IPv6 address is ");
+  PxeBcShowIp6Addr (&Private->TmpStationIp.v6);
+  AsciiPrint ("\n");
+
+  return EFI_SUCCESS;
+
+ON_ERROR:
+  PxeBcDhcp6ClearSlaacState (Private);
+  Dhcp6->Configure (Dhcp6, NULL);
+  return Status;
+}
+
+/**
   Start the DHCPv6 S.A.R.R. process to acquire the IPv6 address and other PXE boot information.
 
   @param[in]  Private           The pointer to PxeBc private data.
@@ -2354,6 +3099,11 @@ PxeBcDhcp6Sarr (
   PxeMode = Private->PxeBc.Mode;
   Ip6Cfg  = Private->Ip6Cfg;
   Timer   = NULL;
+
+  Status = PxeBcDhcp6TrySlaacInfoRequest (Private, Dhcp6);
+  if (!EFI_ERROR (Status)) {
+    return EFI_SUCCESS;
+  }
 
   //
   // Build option list for the request packet.
