@@ -1930,7 +1930,6 @@ PxeBcRegisterIp6Address (
   UINTN                          Index;
   UINT8                          PrefixLength;
 
-  Status    = EFI_SUCCESS;
   MappedEvt = NULL;
   Ip6Addr   = NULL;
   DataSize  = sizeof (EFI_IP6_CONFIG_POLICY);
@@ -3097,7 +3096,6 @@ PxeBcDhcp6Sarr (
   UINTN                                     DataSize;
   EFI_IP6_CONFIG_DUP_ADDR_DETECT_TRANSMITS  DadXmits;
 
-  Status  = EFI_SUCCESS;
   PxeMode = Private->PxeBc.Mode;
   Ip6Cfg  = Private->Ip6Cfg;
   Timer   = NULL;

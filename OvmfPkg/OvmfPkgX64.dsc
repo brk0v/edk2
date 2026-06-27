@@ -577,6 +577,7 @@
   gUefiOvmfPkgTokenSpaceGuid.PcdSecureBootSupported|TRUE
   gEfiMdeModulePkgTokenSpaceGuid.PcdRequireSelfSignedPk|FALSE
 !endif
+  gEfiMdeModulePkgTokenSpaceGuid.PcdPeiMemoryBinsEnable|TRUE
 
 [PcdsFixedAtBuild]
   gEfiMdeModulePkgTokenSpaceGuid.PcdStatusCodeMemorySize|1
@@ -689,6 +690,8 @@
   #
   gUefiCpuPkgTokenSpaceGuid.PcdFirstTimeWakeUpAPsBySipi|FALSE
 
+  gEfiMdePkgTokenSpaceGuid.PcdFSBClock|1000000000
+
 ################################################################################
 #
 # Pcd Dynamic Section - list of all EDK II PCD Entries defined by this Platform
@@ -761,8 +764,6 @@
 
   # Set ConfidentialComputing defaults
   gEfiMdePkgTokenSpaceGuid.PcdConfidentialComputingGuestAttr|0
-
-  gEfiMdePkgTokenSpaceGuid.PcdFSBClock|1000000000
 
 [PcdsDynamicHii]
 !include OvmfPkg/Include/Dsc/OvmfTpmPcdsHii.dsc.inc
@@ -983,6 +984,7 @@
   MdeModulePkg/Bus/Ata/AtaAtapiPassThru/AtaAtapiPassThru.inf
   MdeModulePkg/Bus/Ata/AtaBusDxe/AtaBusDxe.inf
   MdeModulePkg/Bus/Pci/NvmExpressDxe/NvmExpressDxe.inf
+  MdeModulePkg/Bus/Pci/CxlDxe/CxlDxe.inf
   MdeModulePkg/Universal/HiiDatabaseDxe/HiiDatabaseDxe.inf
   MdeModulePkg/Universal/SetupBrowserDxe/SetupBrowserDxe.inf
   MdeModulePkg/Universal/DisplayEngineDxe/DisplayEngineDxe.inf
@@ -1018,6 +1020,7 @@
   MdeModulePkg/Universal/Acpi/BootScriptExecutorDxe/BootScriptExecutorDxe.inf
 !endif
   MdeModulePkg/Universal/Acpi/BootGraphicsResourceTableDxe/BootGraphicsResourceTableDxe.inf
+  OvmfPkg/WsmtDxe/WsmtDxe.inf
 
   #
   # Hash2 Protocol producer
